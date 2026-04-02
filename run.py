@@ -87,25 +87,75 @@ def run_inference(df, llm, params, batch_size=IO_BATCH_SIZE):
     ]
 
     results = []
+    total_output_tokens = 0
     t0 = time.time()
     total = len(prompts)
 
     for i in range(0, total, batch_size):
         batch = prompts[i : i + batch_size]
         outputs = llm.chat(batch, params)
-        results.extend([o.outputs[0].text.strip() for o in outputs])
+        for o in outputs:
+            results.append(o.outputs[0].text.strip())
+            total_output_tokens += len(o.outputs[0].token_ids)
 
         done = i + len(batch)
         speed = done / (time.time() - t0)
         print(f"[{done}/{total}] {speed:.0f} rec/s | ETA: {(total - done) / speed / 60:.1f} min")
 
+    elapsed = time.time() - t0
     df["prediction"] = results
-    print(f"\nDone. {total} records in {(time.time() - t0) / 60:.1f} min")
-    return df
+    stats = {
+        "records": total,
+        "elapsed_s": round(elapsed, 2),
+        "rec_per_s": round(total / elapsed, 1),
+        "tok_per_s": round(total_output_tokens / elapsed, 1),
+    }
+    print(f"\nDone. {total} records in {elapsed / 60:.1f} min | {stats['rec_per_s']} rec/s | {stats['tok_per_s']} tok/s")
+    return df, stats
+
+
+def benchmark(data_path, n=500):
+    """
+    Run all 3 steps on the same n records and print a comparison table.
+    Each LLM is destroyed before loading the next to free GPU memory.
+    """
+    import gc
+    import torch
+
+    df = load_data(data_path, n=n)
+    results = {}
+
+    steps = [
+        ("Step 1: FP16 + prefix cache",  dict(use_fp8=False), dict(guided=False)),
+        ("Step 2: FP8 + prefix cache",   dict(use_fp8=True),  dict(guided=False)),
+        ("Step 3: FP8 + guided decoding", dict(use_fp8=True), dict(guided=True)),
+    ]
+
+    for label, model_kwargs, param_kwargs in steps:
+        print(f"\n{'='*50}\n{label}\n{'='*50}")
+        llm = init_model(**model_kwargs)
+        params = make_sampling_params(**param_kwargs)
+        _, stats = run_inference(df.copy(), llm, params)
+        results[label] = stats
+
+        # release GPU memory before next step
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Print comparison table
+    print("\n" + "=" * 65)
+    print(f"{'Step':<35} {'rec/s':>8} {'tok/s':>10} {'speedup':>9}")
+    print("-" * 65)
+    baseline_rps = results[steps[0][0]]["rec_per_s"]
+    for label, stats in results.items():
+        speedup = f"{stats['rec_per_s'] / baseline_rps:.2f}x"
+        print(f"{label:<35} {stats['rec_per_s']:>8.1f} {stats['tok_per_s']:>10.1f} {speedup:>9}")
+    print("=" * 65)
 
 
 # ============================================================
-# Usage: upgrade one step at a time, compare throughput each step
+# Usage A: run one step at a time
 # ============================================================
 
 # --- Step 1: FP16 baseline ---
@@ -124,4 +174,9 @@ def run_inference(df, llm, params, batch_size=IO_BATCH_SIZE):
 # llm = init_model(use_fp8=True)
 # params = make_sampling_params(guided=True)  # <-- changed here
 # df = load_data("data.parquet", n=100)
-# df = run_inference(df, llm, params)
+# df, stats = run_inference(df, llm, params)
+
+# ============================================================
+# Usage B: benchmark all 3 steps back-to-back, prints comparison table
+# ============================================================
+# benchmark("data.parquet", n=500)
