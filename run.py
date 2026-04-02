@@ -144,14 +144,15 @@ def benchmark(data_path, n=500):
         torch.cuda.empty_cache()
 
     # Print comparison table
-    print("\n" + "=" * 65)
-    print(f"{'Step':<35} {'rec/s':>8} {'tok/s':>10} {'speedup':>9}")
-    print("-" * 65)
+    print("\n" + "=" * 78)
+    print(f"{'Step':<35} {'rec/s':>8} {'tok/s':>10} {'min/1M rec':>12} {'speedup':>9}")
+    print("-" * 78)
     baseline_rps = results[steps[0][0]]["rec_per_s"]
     for label, stats in results.items():
+        min_per_1m = round(1_000_000 / stats["rec_per_s"] / 60, 1)
         speedup = f"{stats['rec_per_s'] / baseline_rps:.2f}x"
-        print(f"{label:<35} {stats['rec_per_s']:>8.1f} {stats['tok_per_s']:>10.1f} {speedup:>9}")
-    print("=" * 65)
+        print(f"{label:<35} {stats['rec_per_s']:>8.1f} {stats['tok_per_s']:>10.1f} {min_per_1m:>12.1f} {speedup:>9}")
+    print("=" * 78)
 
 
 # ============================================================
