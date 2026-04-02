@@ -53,7 +53,7 @@ def init_model(use_fp8=False):
     llm = LLM(
         model=MODEL_NAME,
         dtype=DTYPE,
-        quantization="fp8" if use_fp8 else None,  # [Step 2] FP8: 模型权重减半，吞吐提升~1.3-1.5x
+        quantization="fp8" if use_fp8 else None,  # [Step 2] FP8: halves model weight size, ~1.3-1.5x throughput gain
         enable_prefix_caching=True,
         max_model_len=MAX_MODEL_LEN,
         gpu_memory_utilization=GPU_MEM_UTIL,
@@ -64,18 +64,18 @@ def init_model(use_fp8=False):
 
 def make_sampling_params(guided=False):
     """
-    guided=False → Step 1/2: 普通greedy decode
-    guided=True  → Step 3: 限制输出只能是预定义类别
+    guided=False → Step 1/2: standard greedy decode
+    guided=True  → Step 3: constrain output to predefined categories only
     """
     kwargs = dict(temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
 
     if guided:
-        # [Step 3] Guided Decoding: 强制输出为CATEGORIES中的一个
-        # 效果：decode步数从~10+降到1-3步，速度更快，且不会出现脏输出
+        # [Step 3] Guided Decoding: forces output to be one of CATEGORIES
+        # reduces decode steps from ~10+ to 1-3, faster and no malformed outputs
         kwargs["guided_decoding"] = {
-            "choice": CATEGORIES,  # vLLM会自动约束输出为这些选项之一
+            "choice": CATEGORIES,  # vLLM automatically constrains output to these choices
         }
-        kwargs["max_tokens"] = MAX_TOKENS_GUIDED  # [Step 3] 输出被约束后不需要20 tokens了
+        kwargs["max_tokens"] = MAX_TOKENS_GUIDED  # [Step 3] constrained output needs far fewer tokens
 
     return SamplingParams(**kwargs)
 
@@ -105,7 +105,7 @@ def run_inference(df, llm, params, batch_size=IO_BATCH_SIZE):
 
 
 # ============================================================
-# Usage: 逐步升级，每步对比throughput
+# Usage: upgrade one step at a time, compare throughput each step
 # ============================================================
 
 # --- Step 1: FP16 baseline ---
@@ -114,14 +114,14 @@ def run_inference(df, llm, params, batch_size=IO_BATCH_SIZE):
 # df = load_data("data.parquet", n=100)
 # df = run_inference(df, llm, params)
 
-# --- Step 2: 只改一处 → 开FP8 ---
-# llm = init_model(use_fp8=True)          # <-- 这里改了
+# --- Step 2: one change only → enable FP8 ---
+# llm = init_model(use_fp8=True)          # <-- changed here
 # params = make_sampling_params(guided=False)
 # df = load_data("data.parquet", n=100)
 # df = run_inference(df, llm, params)
 
-# --- Step 3: 再改一处 → 开Guided Decoding ---
+# --- Step 3: one change only → enable Guided Decoding ---
 # llm = init_model(use_fp8=True)
-# params = make_sampling_params(guided=True)  # <-- 这里改了
+# params = make_sampling_params(guided=True)  # <-- changed here
 # df = load_data("data.parquet", n=100)
 # df = run_inference(df, llm, params)
