@@ -126,9 +126,9 @@ def benchmark(data_path, n=500):
     results = {}
 
     steps = [
-        ("Step 1: FP16 + prefix cache",  dict(use_fp8=False), dict(guided=False)),
-        ("Step 2: FP8 + prefix cache",   dict(use_fp8=True),  dict(guided=False)),
-        ("Step 3: FP8 + guided decoding", dict(use_fp8=True), dict(guided=True)),
+        ("Step 1: FP16 + prefix cache",               dict(use_fp8=False), dict(guided=False)),
+        ("Step 2: FP8 + prefix cache",                dict(use_fp8=True),  dict(guided=False)),
+        ("Step 3: FP8 + prefix cache + guided decode", dict(use_fp8=True), dict(guided=True)),
     ]
 
     for label, model_kwargs, param_kwargs in steps:
