@@ -37,12 +37,42 @@ Respond with ONLY the category name, nothing else."""
 # ================================
 
 
-def load_data(path, n=None):
-    df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)
+def load_data(table_name, n=None, spark=None):
+    """
+    Read from an Azure Table via Spark SQL.
+
+    - n is set   → SELECT TOP n, returns a sorted pandas DataFrame in memory
+    - n is None  → streaming: yields pandas chunks of IO_BATCH_SIZE rows,
+                   caller iterates instead of holding everything in RAM
+    """
+    if spark is None:
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+
     if n:
-        df = df.head(n)
-    df = df.sort_values(by=INPUT_COL, key=lambda x: x.str.len()).reset_index(drop=True)
-    return df
+        # Small sample: load fully into pandas, sort by length
+        df = (
+            spark.sql(f"SELECT * FROM {table_name} LIMIT {n}")
+            .toPandas()
+        )
+        df = df.sort_values(by=INPUT_COL, key=lambda x: x.str.len()).reset_index(drop=True)
+        return df
+    else:
+        # Streaming: use toLocalIterator so the full table never sits in RAM at once.
+        # Yields sorted pandas chunks of IO_BATCH_SIZE rows.
+        sdf = spark.sql(f"SELECT * FROM {table_name}")
+        batch = []
+        for row in sdf.toLocalIterator():
+            batch.append(row.asDict())
+            if len(batch) >= IO_BATCH_SIZE:
+                pdf = pd.DataFrame(batch)
+                pdf = pdf.sort_values(by=INPUT_COL, key=lambda x: x.str.len()).reset_index(drop=True)
+                yield pdf
+                batch = []
+        if batch:  # flush remaining rows
+            pdf = pd.DataFrame(batch)
+            pdf = pdf.sort_values(by=INPUT_COL, key=lambda x: x.str.len()).reset_index(drop=True)
+            yield pdf
 
 
 def init_model(use_fp8=False):
@@ -114,21 +144,34 @@ def run_inference(df, llm, params, batch_size=IO_BATCH_SIZE):
     return df, stats
 
 
-def benchmark(data_path, n=500):
+def _free_model(llm):
     """
-    Run all 3 steps on the same n records and print a comparison table.
-    Each LLM is destroyed before loading the next to free GPU memory.
+    Fully release GPU + CPU memory held by a vLLM instance.
+    vLLM spawns Ray actors that hold GPU memory independently of the Python
+    object — simply deleting `llm` is not enough. Ray must be shut down too.
     """
     import gc
     import torch
+    import ray
 
-    df = load_data(data_path, n=n)
+    del llm
+    ray.shutdown()       # tears down all GPU-holding Ray actors
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def benchmark(table_name, n=500, spark=None):
+    """
+    Run all 3 steps on the same n records and print a comparison table.
+    Loads data once, then for each step: init model → run → free all memory.
+    """
+    df = load_data(table_name, n=n, spark=spark)
     results = {}
 
     steps = [
-        ("Step 1: FP16 + prefix cache",               dict(use_fp8=False), dict(guided=False)),
-        ("Step 2: FP8 + prefix cache",                dict(use_fp8=True),  dict(guided=False)),
-        ("Step 3: FP8 + prefix cache + guided decode", dict(use_fp8=True), dict(guided=True)),
+        ("Step 1: FP16 + prefix cache",                dict(use_fp8=False), dict(guided=False)),
+        ("Step 2: FP8 + prefix cache",                 dict(use_fp8=True),  dict(guided=False)),
+        ("Step 3: FP8 + prefix cache + guided decode", dict(use_fp8=True),  dict(guided=True)),
     ]
 
     for label, model_kwargs, param_kwargs in steps:
@@ -138,10 +181,8 @@ def benchmark(data_path, n=500):
         _, stats = run_inference(df.copy(), llm, params)
         results[label] = stats
 
-        # release GPU memory before next step
+        _free_model(llm)   # GPU + Ray actors fully released before next step
         del llm
-        gc.collect()
-        torch.cuda.empty_cache()
 
     # Print comparison table
     print("\n" + "=" * 78)
@@ -159,25 +200,32 @@ def benchmark(data_path, n=500):
 # Usage A: run one step at a time
 # ============================================================
 
-# --- Step 1: FP16 baseline ---
+# --- Step 1: FP16 baseline (sample) ---
+# df = load_data("my_azure_table", n=100)
 # llm = init_model(use_fp8=False)
 # params = make_sampling_params(guided=False)
-# df = load_data("data.parquet", n=100)
-# df = run_inference(df, llm, params)
+# df, stats = run_inference(df, llm, params)
+
+# --- Step 1: FP16 baseline (full table, streaming) ---
+# llm = init_model(use_fp8=False)
+# params = make_sampling_params(guided=False)
+# for chunk in load_data("my_azure_table"):           # no n → streaming chunks
+#     chunk, _ = run_inference(chunk, llm, params)
+#     chunk.to_parquet(f"output_{time.time()}.parquet")
 
 # --- Step 2: one change only → enable FP8 ---
-# llm = init_model(use_fp8=True)          # <-- changed here
+# llm = init_model(use_fp8=True)                      # <-- changed here
 # params = make_sampling_params(guided=False)
-# df = load_data("data.parquet", n=100)
-# df = run_inference(df, llm, params)
+# df = load_data("my_azure_table", n=100)
+# df, stats = run_inference(df, llm, params)
 
 # --- Step 3: one change only → enable Guided Decoding ---
 # llm = init_model(use_fp8=True)
-# params = make_sampling_params(guided=True)  # <-- changed here
-# df = load_data("data.parquet", n=100)
+# params = make_sampling_params(guided=True)           # <-- changed here
+# df = load_data("my_azure_table", n=100)
 # df, stats = run_inference(df, llm, params)
 
 # ============================================================
 # Usage B: benchmark all 3 steps back-to-back, prints comparison table
 # ============================================================
-# benchmark("data.parquet", n=500)
+# benchmark("my_azure_table", n=500)
