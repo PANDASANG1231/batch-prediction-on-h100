@@ -144,28 +144,30 @@ def run_inference(df, llm, params, batch_size=IO_BATCH_SIZE):
     return df, stats
 
 
-def _free_model(llm):
+def _run_one_step(model_kwargs, param_kwargs, records, return_dict):
     """
-    Fully release GPU + CPU memory held by a vLLM instance.
-    vLLM spawns Ray actors that hold GPU memory independently of the Python
-    object — simply deleting `llm` is not enough. Ray must be shut down too.
+    Runs inside a fresh subprocess — owns its own CUDA context.
+    When the subprocess exits the context is destroyed and GPU memory
+    is fully returned to the OS (visible in nvidia-smi).
     """
-    import gc
-    import torch
-    import ray
-
-    del llm
-    ray.shutdown()       # tears down all GPU-holding Ray actors
-    gc.collect()
-    torch.cuda.empty_cache()
+    llm = init_model(**model_kwargs)
+    params = make_sampling_params(**param_kwargs)
+    df = pd.DataFrame(records)
+    _, stats = run_inference(df, llm, params)
+    return_dict["stats"] = stats
 
 
 def benchmark(table_name, n=500, spark=None):
     """
     Run all 3 steps on the same n records and print a comparison table.
-    Loads data once, then for each step: init model → run → free all memory.
+    Each step runs in its own subprocess so GPU memory is fully freed
+    between steps (verified in nvidia-smi).
     """
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+
     df = load_data(table_name, n=n, spark=spark)
+    records = df.to_dict("records")   # pass plain data to subprocess, not a DataFrame
     results = {}
 
     steps = [
@@ -176,13 +178,16 @@ def benchmark(table_name, n=500, spark=None):
 
     for label, model_kwargs, param_kwargs in steps:
         print(f"\n{'='*50}\n{label}\n{'='*50}")
-        llm = init_model(**model_kwargs)
-        params = make_sampling_params(**param_kwargs)
-        _, stats = run_inference(df.copy(), llm, params)
-        results[label] = stats
-
-        _free_model(llm)   # GPU + Ray actors fully released before next step
-        del llm
+        return_dict = mp.Manager().dict()
+        p = mp.Process(
+            target=_run_one_step,
+            args=(model_kwargs, param_kwargs, records, return_dict),
+        )
+        p.start()
+        p.join()   # wait for subprocess to finish and fully release GPU memory
+        if p.exitcode != 0:
+            raise RuntimeError(f"{label} subprocess failed with exit code {p.exitcode}")
+        results[label] = dict(return_dict["stats"])
 
     # Print comparison table
     print("\n" + "=" * 78)
